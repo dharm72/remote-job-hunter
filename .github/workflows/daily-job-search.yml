@@ -1,0 +1,42 @@
+name: Daily Remote Job Search
+
+on:
+  schedule:
+    # 02:30 UTC = 08:00 AM IST (Surat, India) every day
+    - cron: "30 2 * * *"
+  workflow_dispatch: {}   # lets you also trigger it manually from the Actions tab
+
+permissions:
+  contents: write   # needed so the workflow can commit the updated seen_jobs.json
+
+jobs:
+  find-jobs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run job hunter
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python job_hunter.py
+
+      - name: Commit updated seen_jobs.json
+        run: |
+          git config --global user.name "job-hunter-bot"
+          git config --global user.email "actions@github.com"
+          git add seen_jobs.json
+          git diff --quiet --cached || git commit -m "Update seen jobs [skip ci]"
+          git push
