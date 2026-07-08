@@ -2,14 +2,18 @@
 Remote Job Hunter for Dharm Vaghasiya
 --------------------------------------
 Pulls fresh remote job listings from public, no-login job board APIs/feeds,
-scores them against Dharm's resume profile, picks the top 10 new matches,
-and sends the shortlist via Email and Telegram.
+scores them against Dharm's resume profile, and sends the BEST UP TO 10
+matches FROM EACH SOURCE via Email and Telegram (grouped by platform).
 
 Data sources (all free, public, no scraping-behind-login involved):
   - Remotive API        https://remotive.com/api/remote-jobs
   - Arbeitnow API       https://www.arbeitnow.com/api/job-board-api
   - RemoteOK API        https://remoteok.com/api
   - We Work Remotely    RSS feeds (programming + devops categories)
+  - Working Nomads API  https://www.workingnomads.com/api/exposed_jobs/
+  - Jobicy API          https://jobicy.com/api/v2/remote-jobs
+  - Himalayas API       https://himalayas.app/jobs/api
+  - Landing.jobs API    https://landing.jobs/api/v1/jobs
 
 State: seen_jobs.json keeps track of job IDs already sent, so you never get
 the same job twice. Entries older than 45 days are pruned automatically.
@@ -61,8 +65,8 @@ NEGATIVE_TITLE_KEYWORDS = {
     "entry-level": -6, "senior director": -4, "vp of": -8, "chief": -8,
 }
 
-MIN_SCORE_THRESHOLD = 6      # jobs below this score are dropped
-TOP_N = 10                   # how many jobs to send per run
+PER_SOURCE_TOP_N = 10        # how many jobs to send PER SITE, per run
+MIN_SANITY_SCORE = 0         # floor to filter out totally irrelevant/negative matches
 SEEN_JOBS_FILE = "seen_jobs.json"
 SEEN_JOBS_RETENTION_DAYS = 45
 
@@ -149,6 +153,108 @@ def fetch_remoteok():
     return jobs
 
 
+def fetch_working_nomads():
+    jobs = []
+    try:
+        r = requests.get(
+            "https://www.workingnomads.com/api/exposed_jobs/",
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        for j in data:
+            jobs.append({
+                "id": f"workingnomads-{j.get('id') or j.get('url')}",
+                "title": j.get("title", ""),
+                "company": j.get("company_name", ""),
+                "url": j.get("url", ""),
+                "description": (j.get("description") or "")[:3000],
+                "tags": ", ".join(j.get("tags", []) or []),
+                "source": "Working Nomads",
+            })
+    except Exception as e:
+        print(f"[warn] Working Nomads fetch failed: {e}")
+    return jobs
+
+
+def fetch_jobicy():
+    jobs = []
+    try:
+        r = requests.get(
+            "https://jobicy.com/api/v2/remote-jobs",
+            params={"count": 50, "industry": "dev"},
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        for j in data.get("jobs", []):
+            jobs.append({
+                "id": f"jobicy-{j.get('id')}",
+                "title": j.get("jobTitle", ""),
+                "company": j.get("companyName", ""),
+                "url": j.get("url", ""),
+                "description": (j.get("jobExcerpt") or "")[:3000],
+                "tags": ", ".join(j.get("jobIndustry", []) or []),
+                "source": "Jobicy",
+            })
+    except Exception as e:
+        print(f"[warn] Jobicy fetch failed: {e}")
+    return jobs
+
+
+def fetch_himalayas():
+    jobs = []
+    try:
+        r = requests.get(
+            "https://himalayas.app/jobs/api",
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        for j in data.get("jobs", []):
+            jobs.append({
+                "id": f"himalayas-{j.get('guid') or j.get('id')}",
+                "title": j.get("title", ""),
+                "company": (j.get("companyName") or ""),
+                "url": j.get("applicationLink", "") or j.get("url", ""),
+                "description": (j.get("description") or "")[:3000],
+                "tags": ", ".join(j.get("categories", []) or []),
+                "source": "Himalayas",
+            })
+    except Exception as e:
+        print(f"[warn] Himalayas fetch failed: {e}")
+    return jobs
+
+
+def fetch_landing_jobs():
+    jobs = []
+    try:
+        r = requests.get(
+            "https://landing.jobs/api/v1/jobs",
+            params={"remote": "true"},
+            headers=HEADERS, timeout=20,
+        )
+        r.raise_for_status()
+        data = r.json()
+        listings = data if isinstance(data, list) else data.get("jobs", [])
+        for j in listings:
+            company = j.get("company", {})
+            jobs.append({
+                "id": f"landingjobs-{j.get('id') or j.get('slug')}",
+                "title": j.get("title", ""),
+                "company": company.get("name", "") if isinstance(company, dict) else str(company),
+                "url": j.get("url", "") or j.get("share_url", ""),
+                "description": (j.get("description") or j.get("body") or "")[:3000],
+                "tags": ", ".join(
+                    [s.get("name", s) if isinstance(s, dict) else str(s) for s in j.get("skills", []) or []]
+                ),
+                "source": "Landing.jobs",
+            })
+    except Exception as e:
+        print(f"[warn] Landing.jobs fetch failed: {e}")
+    return jobs
+
+
 def fetch_wwr():
     jobs = []
     feeds = [
@@ -232,12 +338,12 @@ def save_seen(seen):
 def format_job_block(rank, job):
     return (
         f"{rank}. {job['title']} — {job['company']}\n"
-        f"   Source: {job['source']} | Match score: {job['score']}\n"
+        f"   Match score: {job['score']}\n"
         f"   Apply: {job['url']}\n"
     )
 
 
-def send_email(jobs):
+def send_email(jobs_by_source):
     user = os.environ.get("EMAIL_USER")
     password = os.environ.get("EMAIL_PASS")
     to_addr = os.environ.get("EMAIL_TO", user)
@@ -245,11 +351,15 @@ def send_email(jobs):
         print("[info] Email secrets not set, skipping email.")
         return
 
+    total = sum(len(v) for v in jobs_by_source.values())
     today = datetime.date.today().isoformat()
-    subject = f"🎯 {len(jobs)} Remote Job Matches for {CANDIDATE_NAME} — {today}"
-    body = f"Good morning! Here are today's top {len(jobs)} remote job matches:\n\n"
-    body += "\n".join(format_job_block(i + 1, j) for i, j in enumerate(jobs))
-    body += "\n\nGenerated automatically by your Remote Job Hunter script."
+    subject = f"🎯 {total} Remote Job Matches for {CANDIDATE_NAME} — {today}"
+    body = f"Good morning! Here are today's best matches from each site (up to {PER_SOURCE_TOP_N} per site):\n\n"
+    for source, jobs in jobs_by_source.items():
+        body += f"=== {source} ({len(jobs)}) ===\n"
+        body += "\n".join(format_job_block(i + 1, j) for i, j in enumerate(jobs))
+        body += "\n"
+    body += "\nGenerated automatically by your Remote Job Hunter script."
 
     msg = MIMEMultipart()
     msg["From"] = user
@@ -267,7 +377,7 @@ def send_email(jobs):
         print(f"[error] Email send failed: {e}")
 
 
-def send_telegram(jobs):
+def send_telegram(jobs_by_source):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -275,27 +385,37 @@ def send_telegram(jobs):
         return
 
     today = datetime.date.today().isoformat()
-    header = f"*🎯 {len(jobs)} Remote Job Matches — {today}*\n\n"
-    lines = []
-    for i, j in enumerate(jobs, 1):
-        lines.append(
-            f"{i}. *{j['title']}* — {j['company']}\n"
-            f"   Score: {j['score']} | {j['source']}\n"
-            f"   {j['url']}"
-        )
-    text = header + "\n\n".join(lines)
-
-    # Telegram messages have a 4096 char limit; split if needed.
-    chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)]
+    total = sum(len(v) for v in jobs_by_source.values())
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for chunk in chunks:
-        try:
-            requests.post(url, data={
-                "chat_id": chat_id, "text": chunk,
-                "parse_mode": "Markdown", "disable_web_page_preview": True,
-            }, timeout=15)
-        except Exception as e:
-            print(f"[error] Telegram send failed: {e}")
+
+    # Send one message per source so each platform's block stays readable
+    # and no single message blows past Telegram's length limit.
+    intro = f"*🎯 {total} Remote Job Matches — {today}*\n(up to {PER_SOURCE_TOP_N} per site)"
+    try:
+        requests.post(url, data={
+            "chat_id": chat_id, "text": intro, "parse_mode": "Markdown",
+        }, timeout=15)
+    except Exception as e:
+        print(f"[error] Telegram intro send failed: {e}")
+
+    for source, jobs in jobs_by_source.items():
+        lines = [f"*— {source} ({len(jobs)}) —*"]
+        for i, j in enumerate(jobs, 1):
+            lines.append(
+                f"{i}. *{j['title']}* — {j['company']}\n"
+                f"   Score: {j['score']}\n"
+                f"   {j['url']}"
+            )
+        text = "\n\n".join(lines)
+        chunks = [text[i:i + 3800] for i in range(0, len(text), 3800)]
+        for chunk in chunks:
+            try:
+                requests.post(url, data={
+                    "chat_id": chat_id, "text": chunk,
+                    "parse_mode": "Markdown", "disable_web_page_preview": True,
+                }, timeout=15)
+            except Exception as e:
+                print(f"[error] Telegram send failed for {source}: {e}")
     print("[info] Telegram message(s) sent.")
 
 
@@ -305,39 +425,47 @@ def send_telegram(jobs):
 
 def main():
     print("Fetching jobs from all sources...")
+    fetchers = [
+        fetch_remotive, fetch_arbeitnow, fetch_remoteok, fetch_wwr,
+        fetch_working_nomads, fetch_jobicy, fetch_himalayas, fetch_landing_jobs,
+    ]
     all_jobs = []
-    all_jobs += fetch_remotive()
-    time.sleep(1)
-    all_jobs += fetch_arbeitnow()
-    time.sleep(1)
-    all_jobs += fetch_remoteok()
-    time.sleep(1)
-    all_jobs += fetch_wwr()
+    for fn in fetchers:
+        all_jobs += fn()
+        time.sleep(1)
     print(f"Fetched {len(all_jobs)} raw listings.")
 
     seen = load_seen()
     today_str = datetime.date.today().isoformat()
 
-    candidates = []
+    # Group by source, score, drop already-seen, sort, and take the best
+    # PER_SOURCE_TOP_N per platform (not a global top 10).
+    by_source = {}
     for job in all_jobs:
         if job["id"] in seen:
             continue
         s = score_job(job)
-        if s >= MIN_SCORE_THRESHOLD:
-            job["score"] = s
-            candidates.append(job)
+        if s < MIN_SANITY_SCORE:
+            continue
+        job["score"] = s
+        by_source.setdefault(job["source"], []).append(job)
 
-    candidates.sort(key=lambda j: j["score"], reverse=True)
-    top_jobs = candidates[:TOP_N]
+    jobs_to_send = {}
+    for source, jobs in by_source.items():
+        jobs.sort(key=lambda j: j["score"], reverse=True)
+        top = jobs[:PER_SOURCE_TOP_N]
+        if top:
+            jobs_to_send[source] = top
 
-    print(f"{len(candidates)} new matches above threshold; sending top {len(top_jobs)}.")
+    total = sum(len(v) for v in jobs_to_send.values())
+    print(f"Sending {total} jobs across {len(jobs_to_send)} sources.")
 
-    if top_jobs:
-        send_email(top_jobs)
-        send_telegram(top_jobs)
-        for job in top_jobs:
-            seen[job["id"]] = today_str
-        save_seen(seen)
+    if jobs_to_send:
+        send_email(jobs_to_send)
+        send_telegram(jobs_to_send)
+        for jobs in jobs_to_send.values():
+            for job in jobs:
+                seen[job["id"]] = today_str
     else:
         print("No new matching jobs today.")
 
